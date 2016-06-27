@@ -84,27 +84,33 @@
 
 
 
-<meta name="description" content="memcached网络模型图
-简单叙述就是memcached网络框架分为主线程（main thread）和工作线程（worker thread），主线程负责连接的建立，工作线程负责请求消息体的接收、处理、响应以及连接的关闭，这种没有脱离《Unix网络编程》里面所列出的几种设计范式（各种模型的使用场景可以参数此书），实际上就是下图中的第8种。
+<meta name="description" content="参考博客：http://blog.csdn.net/column/details/memcached-src.html
+   代码来自：https://github.com/y123456yz/Reading-and-comprehense-memcached-1.4.22
 
-CQ队列及基本操作从网络模型图中我们看到每个工作线程都">
+此博客完全是自己在学习过程中的笔记，没有任何商业用途
+memcached网络模型图
+简单叙述就是memcached">
 <meta property="og:type" content="article">
 <meta property="og:title" content="memcached源码剖析之网络">
 <meta property="og:url" content="http://yoursite.com/2016/06/28/memcached源码剖析之网络/index.html">
 <meta property="og:site_name" content="Practice makes perfect">
-<meta property="og:description" content="memcached网络模型图
-简单叙述就是memcached网络框架分为主线程（main thread）和工作线程（worker thread），主线程负责连接的建立，工作线程负责请求消息体的接收、处理、响应以及连接的关闭，这种没有脱离《Unix网络编程》里面所列出的几种设计范式（各种模型的使用场景可以参数此书），实际上就是下图中的第8种。
+<meta property="og:description" content="参考博客：http://blog.csdn.net/column/details/memcached-src.html
+   代码来自：https://github.com/y123456yz/Reading-and-comprehense-memcached-1.4.22
 
-CQ队列及基本操作从网络模型图中我们看到每个工作线程都">
+此博客完全是自己在学习过程中的笔记，没有任何商业用途
+memcached网络模型图
+简单叙述就是memcached">
 <meta property="og:image" content="https://github.com/chenshuiyin/ImageCache/raw/master/memcached.png">
 <meta property="og:image" content="https://github.com/chenshuiyin/ImageCache/raw/master/网络模型.png">
-<meta property="og:updated_time" content="2016-06-27T17:55:22.000Z">
+<meta property="og:updated_time" content="2016-06-27T18:02:23.000Z">
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="memcached源码剖析之网络">
-<meta name="twitter:description" content="memcached网络模型图
-简单叙述就是memcached网络框架分为主线程（main thread）和工作线程（worker thread），主线程负责连接的建立，工作线程负责请求消息体的接收、处理、响应以及连接的关闭，这种没有脱离《Unix网络编程》里面所列出的几种设计范式（各种模型的使用场景可以参数此书），实际上就是下图中的第8种。
+<meta name="twitter:description" content="参考博客：http://blog.csdn.net/column/details/memcached-src.html
+   代码来自：https://github.com/y123456yz/Reading-and-comprehense-memcached-1.4.22
 
-CQ队列及基本操作从网络模型图中我们看到每个工作线程都">
+此博客完全是自己在学习过程中的笔记，没有任何商业用途
+memcached网络模型图
+简单叙述就是memcached">
 <meta name="twitter:image" content="https://github.com/chenshuiyin/ImageCache/raw/master/memcached.png">
 
 
@@ -288,7 +294,12 @@ CQ队列及基本操作从网络模型图中我们看到每个工作线程都">
       
 
       
-        <h2 id="memcached网络模型图"><a href="#memcached网络模型图" class="headerlink" title="memcached网络模型图"></a>memcached网络模型图</h2><p><img src="https://github.com/chenshuiyin/ImageCache/raw/master/memcached.png" alt="memcached网络"></p>
+        <blockquote>
+<p>   参考博客：<br><a href="http://blog.csdn.net/column/details/memcached-src.html" target="_blank" rel="external">http://blog.csdn.net/column/details/memcached-src.html</a></p>
+<p>   代码来自：<br><a href="https://github.com/y123456yz/Reading-and-comprehense-memcached-1.4.22" target="_blank" rel="external">https://github.com/y123456yz/Reading-and-comprehense-memcached-1.4.22</a></p>
+</blockquote>
+<p>此博客完全是自己在学习过程中的笔记，没有任何商业用途</p>
+<h2 id="memcached网络模型图"><a href="#memcached网络模型图" class="headerlink" title="memcached网络模型图"></a>memcached网络模型图</h2><p><img src="https://github.com/chenshuiyin/ImageCache/raw/master/memcached.png" alt="memcached网络"></p>
 <p>简单叙述就是memcached网络框架分为主线程（main thread）和工作线程（worker thread），主线程负责连接的建立，工作线程负责请求消息体的接收、处理、响应以及连接的关闭，这种没有脱离《Unix网络编程》里面所列出的几种设计范式（各种模型的使用场景可以参数此书），实际上就是下图中的第8种。</p>
 <p><img src="https://github.com/chenshuiyin/ImageCache/raw/master/网络模型.png" alt="memcached网络"></p>
 <h2 id="CQ队列及基本操作"><a href="#CQ队列及基本操作" class="headerlink" title="CQ队列及基本操作"></a>CQ队列及基本操作</h2><p>从网络模型图中我们看到每个工作线程都有一个CQ队列，对应的源码如下。</p>
