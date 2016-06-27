@@ -68,7 +68,7 @@
 <link href="/css/main.css?v=5.0.1" rel="stylesheet" type="text/css" />
 
 
-  <meta name="keywords" content="Hexo, NexT" />
+  <meta name="keywords" content="memcached 网络," />
 
 
 
@@ -84,16 +84,28 @@
 
 
 
-<meta name="description" content="this is a test!">
+<meta name="description" content="memcached网络模型图
+简单叙述就是memcached网络框架分为主线程（main thread）和工作线程（worker thread），主线程负责连接的建立，工作线程负责请求消息体的接收、处理、响应以及连接的关闭，这种没有脱离《Unix网络编程》里面所列出的几种设计范式（各种模型的使用场景可以参数此书），实际上就是下图中的第8种。
+
+从网络模型图中我们看到每个工作线程都有一个CQ队列，对">
 <meta property="og:type" content="article">
 <meta property="og:title" content="memcached源码剖析之网络">
 <meta property="og:url" content="http://yoursite.com/2016/06/28/memcached源码剖析之网络/index.html">
 <meta property="og:site_name" content="Practice makes perfect">
-<meta property="og:description" content="this is a test!">
-<meta property="og:updated_time" content="2016-06-27T16:03:44.000Z">
+<meta property="og:description" content="memcached网络模型图
+简单叙述就是memcached网络框架分为主线程（main thread）和工作线程（worker thread），主线程负责连接的建立，工作线程负责请求消息体的接收、处理、响应以及连接的关闭，这种没有脱离《Unix网络编程》里面所列出的几种设计范式（各种模型的使用场景可以参数此书），实际上就是下图中的第8种。
+
+从网络模型图中我们看到每个工作线程都有一个CQ队列，对">
+<meta property="og:image" content="https://github.com/chenshuiyin/ImageCache/raw/master/memcached.png">
+<meta property="og:image" content="https://github.com/chenshuiyin/ImageCache/raw/master/网络模型.png">
+<meta property="og:updated_time" content="2016-06-27T17:08:21.000Z">
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="memcached源码剖析之网络">
-<meta name="twitter:description" content="this is a test!">
+<meta name="twitter:description" content="memcached网络模型图
+简单叙述就是memcached网络框架分为主线程（main thread）和工作线程（worker thread），主线程负责连接的建立，工作线程负责请求消息体的接收、处理、响应以及连接的关闭，这种没有脱离《Unix网络编程》里面所列出的几种设计范式（各种模型的使用场景可以参数此书），实际上就是下图中的第8种。
+
+从网络模型图中我们看到每个工作线程都有一个CQ队列，对">
+<meta name="twitter:image" content="https://github.com/chenshuiyin/ImageCache/raw/master/memcached.png">
 
 
 
@@ -276,7 +288,71 @@
       
 
       
-        <p>this is a test!</p>
+        <h2 id="memcached网络模型图"><a href="#memcached网络模型图" class="headerlink" title="memcached网络模型图"></a>memcached网络模型图</h2><p><img src="https://github.com/chenshuiyin/ImageCache/raw/master/memcached.png" alt="memcached网络"></p>
+<p>简单叙述就是memcached网络框架分为主线程（main thread）和工作线程（worker thread），主线程负责连接的建立，工作线程负责请求消息体的接收、处理、响应以及连接的关闭，这种没有脱离《Unix网络编程》里面所列出的几种设计范式（各种模型的使用场景可以参数此书），实际上就是下图中的第8种。</p>
+<p><img src="https://github.com/chenshuiyin/ImageCache/raw/master/网络模型.png" alt="memcached网络"></p>
+<p>从网络模型图中我们看到每个工作线程都有一个CQ队列，对应的源码如下。</p>
+<pre><code>typedef struct conn_queue_item  CQ_ITEM;
+
+struct conn_queue_item {
+    int               sfd;
+    enum conn_states  init_state;
+    int               event_flags;
+    int               read_buffer_size;
+    enum network_transport     transport;
+    CQ_ITEM          *next;
+};
+
+/* A connection queue. */
+typedef struct conn_queue  CQ;
+struct conn_queue {
+    CQ_ITEM *head;//指向队列的第一个节点
+    CQ_ITEM *tail;//指向队列的最后一个节点
+    pthread_mutex_t lock; //一个队列就对应一个锁
+};
+</code></pre><p>对于每个工作线程来说，这个队列对应的是一个生产者（main thread）和一个消费者（worker thread），但是仍然需要加锁，phread_mutex_t类型的lock就是用来锁住此队列。然后我们来看一下队列的基本操作（push，pop）的源码。</p>
+<pre><code>static void cq_init(CQ *cq) {
+    pthread_mutex_init(&amp;cq-&gt;lock, NULL);
+    cq-&gt;head = NULL;
+    cq-&gt;tail = NULL;
+}
+
+static CQ_ITEM *cq_pop(CQ *cq) {
+    CQ_ITEM *item;
+
+    pthread_mutex_lock(&amp;cq-&gt;lock);
+    item = cq-&gt;head;
+    if (NULL != item) {
+        cq-&gt;head = item-&gt;next;
+        if (NULL == cq-&gt;head)
+            cq-&gt;tail = NULL;
+    }
+    pthread_mutex_unlock(&amp;cq-&gt;lock);
+
+    return item;
+}
+
+/*
+ * Adds an item to a connection queue.
+ */
+static void cq_push(CQ *cq, CQ_ITEM *item) {
+    item-&gt;next = NULL;
+
+    pthread_mutex_lock(&amp;cq-&gt;lock);
+    if (NULL == cq-&gt;tail)
+          cq-&gt;head = item;
+    else
+        cq-&gt;tail-&gt;next = item;
+    cq-&gt;tail = item;
+    pthread_mutex_unlock(&amp;cq-&gt;lock);
+}
+</code></pre><p>每个worker thread是如何持有这个队列的呢，代码如下。</p>
+<pre><code>typedef struct {
+    ...
+    struct conn_queue *new_conn_queue; /* queue of new connections to handle */
+    ...
+} LIBEVENT_THREAD;
+</code></pre><p>这个LIBEVENT_THREAD顾名思义就是worker线程对应的结构体（为了避免一叶障目，不见森林，我只会在用到时show这部分code，其它部分暂时省略）。</p>
 
       
     </div>
@@ -295,6 +371,12 @@
     </div>
 
     <footer class="post-footer">
+      
+        <div class="post-tags">
+          
+            <a href="/tags/memcached-网络/" rel="tag">#memcached 网络</a>
+          
+        </div>
       
 
       
@@ -383,6 +465,13 @@
           
 
           
+            <div class="site-state-item site-state-tags">
+              <a href="/tags">
+                <span class="site-state-item-count">1</span>
+                <span class="site-state-item-name">tags</span>
+              </a>
+            </div>
+          
 
         </nav>
 
@@ -407,7 +496,7 @@
               
             
             
-              <p class="post-toc-empty">This post does not have a Table of Contents</p>
+              <div class="post-toc-content"><ol class="nav"><li class="nav-item nav-level-2"><a class="nav-link" href="#memcached网络模型图"><span class="nav-number">1.</span> <span class="nav-text">memcached网络模型图</span></a></li></ol></div>
             
           </div>
         </section>
