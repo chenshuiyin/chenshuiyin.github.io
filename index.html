@@ -378,7 +378,7 @@
             <h2 id="memcached网络模型图"><a href="#memcached网络模型图" class="headerlink" title="memcached网络模型图"></a>memcached网络模型图</h2><p><img src="https://github.com/chenshuiyin/ImageCache/raw/master/memcached.png" alt="memcached网络"></p>
 <p>简单叙述就是memcached网络框架分为主线程（main thread）和工作线程（worker thread），主线程负责连接的建立，工作线程负责请求消息体的接收、处理、响应以及连接的关闭，这种没有脱离《Unix网络编程》里面所列出的几种设计范式（各种模型的使用场景可以参数此书），实际上就是下图中的第8种。</p>
 <p><img src="https://github.com/chenshuiyin/ImageCache/raw/master/网络模型.png" alt="memcached网络"></p>
-<p>从网络模型图中我们看到每个工作线程都有一个CQ队列，对应的源码如下。</p>
+<h2 id="CQ队列及基本操作"><a href="#CQ队列及基本操作" class="headerlink" title="CQ队列及基本操作"></a>CQ队列及基本操作</h2><p>从网络模型图中我们看到每个工作线程都有一个CQ队列，对应的源码如下。</p>
 <pre><code>typedef struct conn_queue_item  CQ_ITEM;
 
 struct conn_queue_item {
@@ -440,7 +440,194 @@ static void cq_push(CQ *cq, CQ_ITEM *item) {
     ...
 } LIBEVENT_THREAD;
 </code></pre><p>这个LIBEVENT_THREAD顾名思义就是worker线程对应的结构体（为了避免一叶障目，不见森林，我只会在用到时show这部分code，其它部分暂时省略）。</p>
+<h2 id="主线程与CQ队列"><a href="#主线程与CQ队列" class="headerlink" title="主线程与CQ队列"></a>主线程与CQ队列</h2><p>当一个连接在主线程建立之后，主线程需要创建一个CQ_ITEM结构体并将它push到对应的工作线程的CQ队列中，这个时候并没有直接去malloc，这样有两个缺点，第一，malloc对应一个系统调用，具有相对昂贵的开销，第二，如果每次需要就malloc容易造成内存碎片，为此，作者使用了内存池，预分配一块比较大的内存，将这块大内存切分成多个CQ_ITEM，代码如下。</p>
+<pre><code>//本函数采用了一些优化手段.并非每调用一次本函数就申请一块内存。这会导致
+//内存碎片。这里采取的优化方法是，一次性分配64个CQ_ITEM大小的内存(即预分配).
+//下次调用本函数的时候，直接从之前分配64个中要一个即可。
+//由于是为了防止内存碎片，所以不是以链表的形式放置这64个CQ_ITEM。而是数组的形式。
+//于是，cqi_free函数就有点特别了。它并不会真正释放.而是像内存池那样归还
+static CQ_ITEM *cqi_new(void) {
+    //所有线程都会访问cqi_freelist的。所以需要加锁
+    CQ_ITEM *item = NULL;
+    pthread_mutex_lock(&amp;cqi_freelist_lock);
+    if (cqi_freelist) {
+        item = cqi_freelist;
+           cqi_freelist = item-&gt;next;
+    }
+    pthread_mutex_unlock(&amp;cqi_freelist_lock);
 
+    if (NULL == item) {//没有多余的CQ_ITEM了
+        int i;
+
+        item = malloc(sizeof(CQ_ITEM) * ITEMS_PER_ALLOC);//该宏等于64
+
+        //item[0]直接返回为调用者，不用next指针连在一起。调用者负责将
+        //item[0].next赋值为NULL
+        for (i = 2; i &lt; ITEMS_PER_ALLOC; i++)//将这块内存分成一个个的item并且用next指针像链表一样连起来
+            item[i - 1].next = &amp;item[i];
+
+            pthread_mutex_lock(&amp;cqi_freelist_lock);
+            //因为主线程负责申请CQ_ITEM，子线程负责释放CQ_ITEM。所以cqi_freelist此刻
+            //可能并不等于NULL。由于使用头插法，所以无论cqi_freeelist是否为NULL，都能
+            //把链表连起来的。
+            item[ITEMS_PER_ALLOC - 1].next = cqi_freelist;
+            cqi_freelist = &amp;item[1];
+            pthread_mutex_unlock(&amp;cqi_freelist_lock);
+    }
+
+    return item;
+}
+
+
+//并非释放，而是像内存池那样归还
+static void cqi_free(CQ_ITEM *item) {
+    pthread_mutex_lock(&amp;cqi_freelist_lock);
+    item-&gt;next = cqi_freelist;
+    cqi_freelist = item;  //头插法归还
+    pthread_mutex_unlock(&amp;cqi_freelist_lock);
+}
+</code></pre><p>所有工作线程在释放CQ_ITEM的时候会将CQ_ITEM以头插法插入到cqi_freelist，下一次主线程直接取头节点重用，因为存在多个线程去修改它，所以也需要加锁。<br>主线程是如何做到建立连接之后将CQ_ITEM添加到某个工作线程的队列中并通知此线程呢？首先我们来看main函数。</p>
+<pre><code>int main (int argc, char **argv) {
+    //对memcached的关键设置取默认值
+    settings_init();
+
+    //main_base是一个struct event_base类型的全局变量
+    main_base = event_init();//为主线程创建一个event_base
+
+    conn_init();//先不管，后面会说到
+
+    //创建settings.num_threads个worker线程，并且为每个worker线程创建一个CQ队列
+    //并为这些worker申请各自的event_base，worker线程然后进入事件循环中    
+    thread_init(settings.num_threads, main_base);
+
+    //设置一个定时event(也叫超时event)，定时(频率为一秒)更新current_time变量
+    //这个超时event是add到全局变量main_base里面的，
+    //所以主线程负责更新current_time(这是一个很重要的全局变量)
+    clock_handler(0, 0, 0);
+
+
+    /* create the listening socket, bind it, and init */
+    if (settings.socketpath == NULL) {
+        FILE *portnumber_file = NULL;
+        //创建监听客户端的socket
+        //tcp_transport是枚举类型
+        if (settings.port &amp;&amp; 
+            server_sockets(settings.port, tcp_transport,portnumber_file)) {
+            vperror(&quot;failed to listen on TCP port %d&quot;, settings.port);
+            exit(EX_OSERR);
+        }
+    }
+
+    if (event_base_loop(main_base, 0) != 0) {//主线程进入事件循环
+        retval = EXIT_FAILURE;
+    }
+
+    return retval;
+}
+</code></pre><p>main函数中创建了属于自己的event_base，thread_init函数是初始化worker thread的，这个我们下面再说，server_sockets负责创建secket并加入可读事件回调，然后主线程就进入event_base_loop事件循环中，下面我们来看看server_sockets函数以及它所调用的其它函数。</p>
+<pre><code>//port是默认的11211或者用户使用-p选项设置的端口号
+//主线程在main函数会调用本函数
+static int server_sockets(int port, 
+                          enum network_transport transport,
+                          FILE *portnumber_file) {
+
+    //settings.inter里面可能有多个IP地址.如果有多个那么将用逗号分隔
+    char *b;
+    int ret = 0;
+    //复制一个字符串，避免下面的strtok_r函数修改(污染)全局变量settings.inter
+    char *list = strdup(settings.inter);
+
+    //这个循环主要是处理多个IP的情况
+    for (char *p = strtok_r(list, &quot;;,&quot;, &amp;b);
+        p != NULL; //分割出一个个的ip,使用分号;作为分隔符
+         p = strtok_r(NULL, &quot;;,&quot;, &amp;b)) {
+        int the_port = port;
+        char *s = strchr(p, &apos;:&apos;);//启动的可能使用-l ip:port 参数形式
+        //ip后面接着端口号，即指定ip的同时也指定了该ip的端口号
+        //此时采用ip后面的端口号，而不是采用-p指定的端口号
+        if (s != NULL) {
+            *s = &apos;\0&apos;;//截断后面的端口号，使得p指向的字符串只是一个ip
+            ++s;
+            if (!safe_strtol(s, &amp;the_port)) {//非法端口号参数值
+                return 1;
+            }
+        }
+        if (strcmp(p, &quot;*&quot;) == 0) {
+            p = NULL;
+        }
+        //处理其中一个IP。有p指定ip(或者hostname)
+        ret |= server_socket(p, the_port, transport, portnumber_file);
+    }
+    free(list);
+    return ret;
+}
+
+
+static conn *listen_conn = NULL;//监听队列(可能要同时监听多个IP)
+
+//interface是一个ip、hostname或者NULL。这个ip字符串后面没有端口号。端口号由参数port指出
+static int server_socket(const char *interface,
+                          int port,
+                          enum network_transport transport,
+                          FILE *portnumber_file) {
+    int sfd;
+    struct linger ling = {0, 0};
+    struct addrinfo *ai;
+    struct addrinfo *next;
+    struct addrinfo hints = { .ai_flags = AI_PASSIVE,
+                                .ai_family = AF_UNSPEC };
+    char port_buf[NI_MAXSERV];
+    int success = 0;
+    int flags =1;
+
+    hints.ai_socktype = IS_UDP(transport) ? SOCK_DGRAM : SOCK_STREAM;
+
+
+    snprintf(port_buf, sizeof(port_buf), &quot;%d&quot;, port);
+    getaddrinfo(interface, port_buf, &amp;hints, &amp;ai);
+
+    //如果interface是一个hostname的话，那么可能就有多个ip
+    for (next= ai; next; next= next-&gt;ai_next) {
+        conn *listen_conn_add;
+
+        //创建一个套接字，然后设置为非阻塞的
+        sfd = new_socket(next);//调用socket函数
+        bind(sfd, next-&gt;ai_addr, next-&gt;ai_addrlen);
+
+        success++;
+        listen(sfd, settings.backlog);
+
+
+        if (!(listen_conn_add = conn_new(sfd, conn_listening,
+                                         EV_READ | EV_PERSIST, 1,
+                                     t     ransport, main_base))) {
+            fprintf(stderr, &quot;failed to create listening connection\n&quot;);
+            exit(EXIT_FAILURE);
+        }
+
+        //将要监听的多个conn放到一个监听队列里面
+        listen_conn_add-&gt;next = listen_conn;
+        listen_conn = listen_conn_add;
+
+    }
+
+    freeaddrinfo(ai);
+
+    /* Return zero iff we detected no errors in starting up connections */
+    return success == 0;
+}
+
+
+static int new_socket(struct addrinfo *ai) {
+    int sfd;
+    int flags;
+    sfd = socket(ai-&gt;ai_family, ai-&gt;ai_socktype, ai-&gt;ai_protocol);
+    flags = fcntl(sfd, F_GETFL, 0);
+    fcntl(sfd, F_SETFL, flags | O_NONBLOCK);
+
+    return sfd;
+}
+</code></pre>
           
         
       
