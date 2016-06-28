@@ -175,7 +175,7 @@
             
               <i class="menu-item-icon fa fa-fw fa-home"></i> <br />
             
-            Home
+            Startseite
           </a>
         </li>
       
@@ -185,7 +185,7 @@
             
               <i class="menu-item-icon fa fa-fw fa-archive"></i> <br />
             
-            Archives
+            Archiv
           </a>
         </li>
       
@@ -251,7 +251,7 @@
             <span class="post-meta-item-icon">
               <i class="fa fa-calendar-o"></i>
             </span>
-            <span class="post-meta-item-text">Posted on</span>
+            <span class="post-meta-item-text">Veröffentlicht am</span>
             <time itemprop="dateCreated" datetime="2016-06-28T00:04:54+08:00" content="2016-06-28">
               2016-06-28
             </time>
@@ -344,7 +344,7 @@
             <span class="post-meta-item-icon">
               <i class="fa fa-calendar-o"></i>
             </span>
-            <span class="post-meta-item-text">Posted on</span>
+            <span class="post-meta-item-text">Veröffentlicht am</span>
             <time itemprop="dateCreated" datetime="2016-06-28T00:03:20+08:00" content="2016-06-28">
               2016-06-28
             </time>
@@ -529,7 +529,7 @@ static void cqi_free(CQ_ITEM *item) {
 
     return retval;
 }
-</code></pre><p>main函数中创建了属于自己的event_base，thread_init函数是初始化worker thread的，这个我们下面再说，server_sockets负责创建secket并加入可读事件回调，然后主线程就进入event_base_loop事件循环中，下面我们来看看server_sockets函数以及它所调用的其它函数。</p>
+</code></pre><p>main函数中创建了属于自己的event_base，thread_init函数是初始化worker thread的，这个我们下面再说，server_sockets负责创建socket并加入可读事件回调，然后主线程就进入event_base_loop事件循环中，下面我们来看看server_sockets函数以及它所调用的其它函数。</p>
 <pre><code>//port是默认的11211或者用户使用-p选项设置的端口号
 //主线程在main函数会调用本函数
 static int server_sockets(int port, 
@@ -632,7 +632,317 @@ static int new_socket(struct addrinfo *ai) {
 
     return sfd;
 }
-</code></pre>
+</code></pre><p>我们需要关心的是conn_new这个函数，它既会被主线程调用，也会被工作线程调用，下面我们来看看它的源码。</p>
+<pre><code>//thread_libevent_process这个管道事件回调使用于主线程接受到客户端连接后通知工作子线程重新创建一个新的
+//conn，在conn_new重新设置网络事件回调函数conn_new-&gt;event_handler
+
+//为sfd分配一个conn结构体，并且为这个sfd建立一个event，然后base监听这个event
+//这里面会设置网络事件回调函数conn_new-&gt;event_handler
+conn *conn_new(const int sfd, enum conn_states init_state,
+               const int event_flags, const int read_buffer_size, 
+               enum network_transport transport, struct event_base *base) {
+    conn *c;
+
+    assert(sfd &gt;= 0 &amp;&amp; sfd &lt; max_fds);
+    //直接使用下标
+    c = conns[sfd];
+
+    //之前没有哪个连接用过这个sfd值，需要申请一个conn结构体
+    if (NULL == c) {
+        if (!(c = (conn *)calloc(1, sizeof(conn)))) {
+            STATS_LOCK();
+            stats.malloc_fails++;
+            STATS_UNLOCK();
+            fprintf(stderr, &quot;Failed to allocate connection object\n&quot;);
+            return NULL;
+        }
+        MEMCACHED_CONN_CREATE(c);
+        //初始化一些成员变量
+         c-&gt;sfd = sfd;
+        //将这个结构体交由conns数组管理
+        conns[sfd] = c;
+    }
+    ...//初始化另外一些成员变量  
+    c-&gt;state = init_state;//值为conn_listening  
+
+    //等同于event_assign，会自动关联current_base。event的回调函数是event_handler  
+    event_set(&amp;c-&gt;event, sfd, event_flags, event_handler, (void *)c);  
+    event_base_set(base, &amp;c-&gt;event);  
+    c-&gt;ev_flags = event_flags;  
+
+    if (event_add(&amp;c-&gt;event, 0) == -1) {  
+        perror(&quot;event_add&quot;);  
+        return NULL;  
+    }  
+
+    return c;  
+}  
+</code></pre><p>这个函数最重要的一件事就是为server_socket中建立的socket设置可读事件回调函数event_handler，而且连接的初始状态事conn_listening，这个状态是主线程唯一的状态，下面我们来抽丝剥茧看看event_handler做了什么。</p>
+<pre><code>void event_handler(const int fd, const short which, void *arg) {
+    conn *c;
+
+    c = (conn *)arg;
+    assert(c != NULL);
+
+    c-&gt;which = which;
+
+    /* sanity */
+    if (fd != c-&gt;sfd) {
+        if (settings.verbose &gt; 0)
+            fprintf(stderr, &quot;Catastrophic: event fd doesn&apos;t match conn fd!\n&quot;);
+        conn_close(c);
+        return;
+    }
+
+    drive_machine(c);
+
+    /* wait for next event */
+    return;
+}
+</code></pre><p>它由调用了drive_machine，真是各种调啊，让我们揭开drive_machine的神秘面纱吧。</p>
+<pre><code>//主线程接收到客户端连接，通过event_handler触发drive_machine发送信息&quot;c&quot;给工作子线程进行处理
+//工作子线程从队列中取出主线程accept的fd,
+//thread_libevent_process中取出该CQ_ITEM后，创建新的conn进行事件处理
+static void drive_machine(conn *c) {
+    bool stop = false;
+    int sfd;
+    socklen_t addrlen;
+    struct sockaddr_storage addr;
+    int nreqs = settings.reqs_per_event;//20
+
+    //drive_machine被调用会进行状态判断，并进行一些处理。但也可能发生状态的转换
+    //此时需要一个循环，当进行专题转换时，也能处理
+    while (!stop) {
+        switch(c-&gt;state) {
+            case conn_listening: //只有主线程处于该状态
+                   addrlen = sizeof(addr);
+
+                sfd = accept(c-&gt;sfd, (struct sockaddr *)&amp;addr, &amp;addrlen);                   
+                if (settings.maxconns_fast &amp;&amp;
+                    stats.curr_conns + stats.reserved_fds &gt;= settings.maxconns - 1) {
+                    str = &quot;ERROR Too many open connections\r\n&quot;;
+                    res = write(sfd, str, strlen(str));
+                    close(sfd);
+                    STATS_LOCK();
+                    stats.rejected_conns++;
+                    STATS_UNLOCK();
+                } else {
+                    //选定一个worker线程，new一个CQ_ITEM，把这个CQ_ITEM扔给这个线程
+                    dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
+                                 DATA_BUFFER_SIZE, tcp_transport);
+                }
+
+            stop = true;
+            break;
+        }
+    }
+    return
+}
+</code></pre><p>drive_machine是一个状态机，包涵了整个网络模型的所有事件状态，这里只是列出了主线程用到的conn_listening状态，dispatch_conn_new函数完成了选定一个worker线程，new一个CQ_ITEM，把这个CQ_ITEM扔给这个线程并通知它，我们来看看它是怎么做到的。</p>
+<pre><code>//工作子线程读管道有数据到来，thread_libevent_process从读管道读取到信息
+//对应的主线程写管道在dispatch_conn_new或者switch_item_lock_type
+
+//主线程检查到有新的链接到来，则通过管道通知子线程
+void dispatch_conn_new(int sfd, enum conn_states init_state, 
+                       int event_flags, int read_buffer_size, 
+                       enum network_transport transport) {
+    CQ_ITEM *item = cqi_new();
+    char buf[1];
+    //轮询的方式选定一个worker线程
+    int tid = (last_thread + 1) % settings.num_threads;
+
+    LIBEVENT_THREAD *thread = threads + tid; //轮询选择由那个工作现场来处理
+
+    last_thread = tid;
+
+    item-&gt;sfd = sfd;
+    item-&gt;init_state = init_state;
+    item-&gt;event_flags = event_flags;
+    item-&gt;read_buffer_size = read_buffer_size;
+    item-&gt;transport = transport;
+    //把这个item放到选定的worker线程的CQ队列中
+    cq_push(thread-&gt;new_conn_queue, item);
+
+    MEMCACHED_CONN_DISPATCH(sfd, thread-&gt;thread_id);
+    buf[0] = &apos;c&apos;;
+    // 通知worker线程，有新客户单连接到来
+    if (write(thread-&gt;notify_send_fd, buf, 1) != 1) {
+        perror(&quot;Writing to thread notify pipe&quot;);
+    }
+}
+</code></pre><p>我们可以很清楚的看到，主线程采用轮询的方式选取一个工作线程，调用cq_push将CQ_ITEM放入工作线程的队列中，然后向管道写入一个字符，来唤醒工作线程。<br>至此主线程处理逻辑已经基本完成，由于调用链路较长，我们再重新来简单的梳理下。</p>
+<blockquote>
+<p>主线程：server_sockets–&gt;server_socket–&gt;conn_new–&gt;event_set(注册socket可读事件回调event_handler)</p>
+<p>回调函数：event_handle–&gt;drive_machine–&gt;dispatch_conn_new</p>
+</blockquote>
+<h2 id="工作线程与CQ队列"><a href="#工作线程与CQ队列" class="headerlink" title="工作线程与CQ队列"></a>工作线程与CQ队列</h2><p>工作线程的初始化在main函数中的thread_init函数中，让我们来看看吧。</p>
+<pre><code>//参数nthread是woker线程的数量。main_base则是主线程的event_base
+//主线程在main函数调用本函数，创建nthreads个worker线程
+void thread_init(int nthreads, struct event_base *main_base) {
+    int         i;
+    int         power;
+
+    //申请一个CQ_ITEM时需要加锁
+    pthread_mutex_init(&amp;cache_lock, NULL);
+    pthread_mutex_init(&amp;stats_lock, NULL);
+
+    pthread_mutex_init(&amp;init_lock, NULL);
+    pthread_cond_init(&amp;init_cond, NULL);
+
+    pthread_mutex_init(&amp;cqi_freelist_lock, NULL);
+    cqi_freelist = NULL;
+
+    item_lock_count = hashsize(power);
+    item_lock_hashpower = power;
+
+    //哈希表中段级别的锁。并不是一个桶就对应有一个锁。而是多个桶共用一个锁
+    item_locks = calloc(item_lock_count, sizeof(pthread_mutex_t));
+    if (! item_locks) {
+        perror(&quot;Can&apos;t allocate item locks&quot;);
+        exit(1);
+    }
+    for (i = 0; i &lt; item_lock_count; i++) {
+        pthread_mutex_init(&amp;item_locks[i], NULL);
+    }
+    pthread_key_create(&amp;item_lock_type_key, NULL);
+    pthread_mutex_init(&amp;item_global_lock, NULL);
+
+    //申请具有nthreads个元素的LIBEVENT_THREAD数据
+    threads = calloc(nthreads, sizeof(LIBEVENT_THREAD));
+    if (! threads) {
+        perror(&quot;Can&apos;t allocate thread descriptors&quot;);
+        exit(1);
+    }
+    //主线程对应的
+    dispatcher_thread.base = main_base;
+    dispatcher_thread.thread_id = pthread_self();
+
+    //子线程的
+    for (i = 0; i &lt; nthreads; i++) {
+        int fds[2];
+        //为每个worker线程分配一个管道，用于通知worker线程
+        if (pipe(fds)) {
+            perror(&quot;Can&apos;t create notify pipe&quot;);
+            exit(1);
+        }
+
+        threads[i].notify_receive_fd = fds[0];
+        threads[i].notify_send_fd = fds[1];
+        //每一个线程配一个event_base，并设置event监听notify_receive_fd的读事件
+        //同时还为这个线程分配一个conn_queue队列
+        setup_thread(&amp;threads[i]);
+        /* Reserve three fds for the libevent base, and two for the pipe */
+        stats.reserved_fds += 5;
+    }
+
+    /* Create threads after we&apos;ve done all the libevent setup. */
+    for (i = 0; i &lt; nthreads; i++) {
+         //创建线程，线程函数为worker_libevent，线程参数为&amp;thread[i]
+        create_worker(worker_libevent, &amp;threads[i]);
+    }
+
+    /* Wait for all the threads to set themselves up before returning. */
+    pthread_mutex_lock(&amp;init_lock);
+    wait_for_thread_registration(nthreads); //主线程阻塞等待事件到来
+    pthread_mutex_unlock(&amp;init_lock);
+}
+</code></pre><p>代码说明了一切，请注意最后的wait_for_thread_registration函数，主线程将在此阻塞，直到所有的工作线程都初始化完成，我们来看看setup_thread函数。</p>
+<pre><code>static void setup_thread(LIBEVENT_THREAD *me) {
+    //新建一个event_base
+    me-&gt;base = event_init();
+
+    /* Listen for notifications from other threads */
+    //监听管道的读端
+    event_set(&amp;me-&gt;notify_event, me-&gt;notify_receive_fd,
+                EV_READ | EV_PERSIST, thread_libevent_process, me);
+    //将event_base和event想关联
+    event_base_set(me-&gt;base, &amp;me-&gt;notify_event);
+
+    if (event_add(&amp;me-&gt;notify_event, 0) == -1) {
+        fprintf(stderr, &quot;Can&apos;t monitor libevent notify pipe\n&quot;);
+        exit(1);
+    }
+    // 创建一个CQ队列
+    me-&gt;new_conn_queue = malloc(sizeof(struct conn_queue));
+    if (me-&gt;new_conn_queue == NULL) {
+        perror(&quot;Failed to allocate memory for connection queue&quot;);
+        exit(EXIT_FAILURE);
+    }
+    cq_init(me-&gt;new_conn_queue);
+
+    if (pthread_mutex_init(&amp;me-&gt;stats.mutex, NULL) != 0) {
+        perror(&quot;Failed to initialize mutex&quot;);
+        exit(EXIT_FAILURE);
+    }
+
+    me-&gt;suffix_cache = cache_create(&quot;suffix&quot;, SUFFIX_SIZE, sizeof(char*),
+                                NULL, NULL);
+    if (me-&gt;suffix_cache == NULL) {
+        fprintf(stderr, &quot;Failed to create suffix cache\n&quot;);
+        exit(EXIT_FAILURE);
+    }
+}
+</code></pre><p>这个函数做的比较重要的事是为管道读端注册可读事件回调thread_libevent_process，用来处理主线程写入的字符，创建了CQ队列，让我们来看看事件回调函数。</p>
+<pre><code>//工作子线程读管道有数据到来，thread_libevent_process从读管道读取到信息
+//对应的主线程写管道在dispatch_conn_new或者switch_item_lock_type
+static void thread_libevent_process(int fd, short which, void *arg) {
+    LIBEVENT_THREAD *me = arg;
+    CQ_ITEM *item;
+    char buf[1];
+
+    if (read(fd, buf, 1) != 1)
+       switch (buf[0]) {
+            case &apos;c&apos;: //dispatch_conn_new
+            //从CQ队列中读取一个item，因为是pop所以读取后，CQ队列会把这个item从队列中删除
+                item = cq_pop(me-&gt;new_conn_queue);
+
+                if (NULL != item) {
+            //为sfd分配一个conn结构体，并且为这个sfd建立一个event，然后让base监听这个event
+            //这个sfd的事件回调函数是event_handler
+                    conn *c = conn_new(item-&gt;sfd, item-&gt;init_state, 
+                    item-&gt;event_flags, item-&gt;read_buffer_size, 
+                    item-&gt;transport, me-&gt;base);
+                } else {
+                    c-&gt;thread = me;
+                }
+                cqi_free(item);
+                break;
+            //switch_item_lock_type触发走到这里
+            /* we were told to flip the lock type and report in */
+            case &apos;l&apos;: //参考switch_item_lock_type //切换item到段级别
+            //唤醒睡眠在init_cond条件变量上的迁移线程
+                me-&gt;item_lock_type = ITEM_LOCK_GRANULAR;
+                register_thread_initialized();
+                break;
+            case &apos;g&apos;://切换item锁到全局级别
+                me-&gt;item_lock_type = ITEM_LOCK_GLOBAL;
+                register_thread_initialized();
+                break;
+        }
+    }
+}
+</code></pre><p>我们可以看到工作线程会从自己的队列里面取出主线程push的CQ_ITEM，然后调用conn_new同样注册事件回调event_handler，最后会走到drive_machine，这个逻辑和主线程是一样的。让我们再看看thread_init里面的create_worker函数。</p>
+<pre><code>static void create_worker(void *(*func)(void *), void *arg) {
+    pthread_t       thread;
+    pthread_attr_t  attr;
+    int             ret;
+
+    pthread_attr_init(&amp;attr);
+
+    if ((ret = pthread_create(&amp;thread, &amp;attr, func, arg)) != 0) {
+        fprintf(stderr, &quot;Can&apos;t create thread: %s\n&quot;,
+            strerror(ret));
+        exit(1);
+    }
+}
+</code></pre><p>这个函数就是真正的创建工作线程的地方，在所有的回调函数都设置完毕之后就可以启动工作线程了，我们还是来简单的梳理下调用过程。</p>
+<blockquote>
+<p>主线程：thread_init–&gt;setup_thread(注册可读事件回调thread_libevent_process)</p>
+<p>回调函数：thread_libevent_process–&gt;conn_new–&gt;event_handler–&gt;drive_machine</p>
+<p>主线程：thread_init–&gt;create_worker–&gt;pthread_create</p>
+</blockquote>
+<p>这样整个memcached的网络部分就算是过了一遍，如果想详细的了解还得看代码，再次感谢文章开头所参考的博客和代码的作者。</p>
+
           
         
       
@@ -702,7 +1012,7 @@ static int new_socket(struct addrinfo *ai) {
           <div class="site-state-item site-state-posts">
             <a href="/archives">
               <span class="site-state-item-count">2</span>
-              <span class="site-state-item-name">posts</span>
+              <span class="site-state-item-name">Artikel</span>
             </a>
           </div>
 
@@ -712,7 +1022,7 @@ static int new_socket(struct addrinfo *ai) {
             <div class="site-state-item site-state-tags">
               <a href="/tags">
                 <span class="site-state-item-count">1</span>
-                <span class="site-state-item-name">tags</span>
+                <span class="site-state-item-name">Tags</span>
               </a>
             </div>
           
@@ -756,7 +1066,7 @@ static int new_socket(struct addrinfo *ai) {
 </div>
 
 <div class="powered-by">
-  Powered by <a class="theme-link" href="http://hexo.io">Hexo</a>
+  Erstellt mit  <a class="theme-link" href="http://hexo.io">Hexo</a>
 </div>
 
 <div class="theme-info">
