@@ -722,6 +722,354 @@ static void *do_slabs_alloc(const size_t size, unsigned int id) {
             
               
                 
+                <a class="post-title-link" href="/2016/06/28/memcached源码剖析之hash表及基本操作/" itemprop="url">
+                  memcached源码剖析之hash表及基本操作
+                </a>
+              
+            
+          </h1>
+        
+
+        <div class="post-meta">
+          <span class="post-time">
+            <span class="post-meta-item-icon">
+              <i class="fa fa-calendar-o"></i>
+            </span>
+            <span class="post-meta-item-text">Veröffentlicht am</span>
+            <time itemprop="dateCreated" datetime="2016-06-28T00:03:20+08:00" content="2016-06-28">
+              2016-06-28
+            </time>
+          </span>
+
+          
+
+          
+            
+          
+
+          
+
+          
+          
+
+          
+        </div>
+      </header>
+    
+
+
+    <div class="post-body" itemprop="articleBody">
+
+      
+      
+
+      
+        
+          
+            <blockquote>
+<p>   参考博客：<br><a href="http://blog.csdn.net/column/details/memcached-src.html" target="_blank" rel="external">http://blog.csdn.net/column/details/memcached-src.html</a></p>
+<p>   代码来自：<br><a href="https://github.com/y123456yz/Reading-and-comprehense-memcached-1.4.22" target="_blank" rel="external">https://github.com/y123456yz/Reading-and-comprehense-memcached-1.4.22</a></p>
+</blockquote>
+<p>此博客完全是自己在学习过程中的笔记，没有任何商业用途</p>
+<h2 id="Hash表的定义"><a href="#Hash表的定义" class="headerlink" title="Hash表的定义"></a>Hash表的定义</h2><p>memcached的hash函数根据配置可以使用jenkins_hash或者murmur3哈希，数据结构定义如下。</p>
+<pre><code>unsigned int hashpower = HASHPOWER_DEFAULT;
+
+//哈希表数组指针
+static item** primary_hashtable = 0;
+
+//当hash扩展的时候，用于存放旧的hashtable
+static item** old_hashtable = 0;
+
+static unsigned int hash_items = 0;
+
+//hash扩展的时候置true
+static bool expanding = false; 
+
+static bool started_expanding = false;
+</code></pre><p>源码中底数为2，指数为hashpower，这样一个幂指数用来表示hash表的大小，之所以这样表示是为了取模的时候方便计算，因为 a % (2^n) 等价于 a &amp; (2^n - 1)，另外需要说明的一点是memecached使用链地址来解决冲突问题。</p>
+<h3 id="Hash表初始化"><a href="#Hash表初始化" class="headerlink" title="Hash表初始化"></a>Hash表初始化</h3><pre><code>//默认参数为0.本函数由main函数调用，参数的默认值为0
+void assoc_init(const int hashtable_init) {
+    if (hashtable_init) {
+        hashpower = hashtable_init;
+    }
+    //因为哈希表会慢慢增大，所以要使用动态内存分配。
+    //哈希表存储的数据是一个指针，这样更省空间。
+    //hashsize(hashpower)就是哈希表的长度了
+    primary_hashtable = calloc(hashsize(hashpower),
+                               sizeof(void *));
+    if (! primary_hashtable) {
+        fprintf(stderr, &quot;Failed to init hashtable.\n&quot;);
+        exit(EXIT_FAILURE);
+        //哈希表是memcached工作的基础，如果失败只能退出运行
+    }
+    STATS_LOCK();
+    stats.hash_power_level = hashpower;
+    stats.hash_bytes = hashsize(hashpower) * sizeof(void *);
+    STATS_UNLOCK();
+}
+</code></pre><h3 id="Hash表查找"><a href="#Hash表查找" class="headerlink" title="Hash表查找"></a>Hash表查找</h3><pre><code>//由于哈希值只能确定是在哈希表中的哪个桶(bucket)，但一个桶里      面是有一条冲突链的
+//此时需要用到具体的键值遍历并一一比较冲突链上的所有节点。虽然      key是以&apos;\0&apos;结尾的
+//字符串，但调用strlen还是有点耗时(需要遍历键值字符串)。所以      需要另外一个参数nkey
+//指明这个key的长度用于快速查找该key对应的item
+item *assoc_find(const char *key, 
+                const size_t nkey, 
+                const uint32_t hv) {
+    item *it;
+    unsigned int oldbucket;
+
+    if (expanding &amp;&amp;
+        (oldbucket = 
+        (hv &amp; hashmask(hashpower - 1))) &gt;=     
+        expand_bucket) {
+        it = old_hashtable[oldbucket];
+    } else {
+        //由哈希值判断这个key是属于哪个桶的
+        it = primary_hashtable[hv &amp;
+                                  hashmask(hashpower)];
+    }    
+
+    //到这里，已经确定这个key是属于哪个桶的，遍历对应桶的冲突链即可
+    item *ret = NULL;
+    int depth = 0;
+    while (it) {
+         //长度相同的情况下才调用memcmp比较，更高效
+        if ((nkey == it-&gt;nkey) &amp;&amp; 
+            (memcmp(key, ITEM_key(it), nkey) == 0)) {
+            ret = it;
+            break;
+        }
+        it = it-&gt;h_next;
+        ++depth;
+    }
+    MEMCACHED_ASSOC_FIND(key, nkey, depth);
+    return ret;
+}
+</code></pre><h3 id="Hash表插入"><a href="#Hash表插入" class="headerlink" title="Hash表插入"></a>Hash表插入</h3><p> 因为插入的时候可能哈希表正在扩展，所以插入的时候要面临一个选择：插入到新表还是旧表？memcached的做法是：当item对应在旧表中的桶还没被迁移到新表的话，就插入到旧表，否则插入到新表。</p>
+<pre><code>//hv是这个item键值的哈希值，用于快速查找该key对应的item
+int assoc_insert(item *it, const uint32_t hv) {
+    unsigned int oldbucket; 
+
+    //使用头插法，插入一个item
+    //第一次看本函数，直接看else部分
+    if (expanding &amp;&amp;
+        (oldbucket = (hv &amp; hashmask(hashpower - 1))) 
+         &gt;= expand_bucket) {
+            it-&gt;h_next = old_hashtable[oldbucket];
+            old_hashtable[oldbucket] = it;
+    } else {
+           //使用头插法插入哈希表中
+        it-&gt;h_next = primary_hashtable[hv &amp; 
+                                hashmask(hashpower)];
+        primary_hashtable[hv &amp; hashmask(hashpower)] = it;
+    }
+
+    hash_items++;//哈希表的item数量加一
+    if (! expanding &amp;&amp; hash_items &gt; 
+       (hashsize(hashpower) * 3) / 2) {
+        assoc_start_expand();
+    }
+
+    MEMCACHED_ASSOC_INSERT(ITEM_key(it), 
+                           it-&gt;nkey, hash_items);
+    return 1;
+}
+</code></pre><h3 id="Hash表删除"><a href="#Hash表删除" class="headerlink" title="Hash表删除"></a>Hash表删除</h3><pre><code>void assoc_delete(const char *key, 
+                  const size_t nkey, 
+                  const uint32_t hv) {
+    //得到前驱结点的h_next成员地址
+    item **before = _hashitem_before(key, nkey, hv);
+
+    if (*before) {//查找成功
+        item *nxt;
+        hash_items--;
+
+        MEMCACHED_ASSOC_DELETE(key, nkey, hash_items);
+
+        //因为before是一个二级指针，
+        //其值为所查找item的前驱item的h_next成员地址
+        //所以*before指向的是所查找的item。
+        //因为before是一个二级指针，所以*before
+        //作为左值时，可以给h_next成员变量赋值。
+        //所以下面三行代码是使得删除中间的item后，
+        //前后的item还能连接起来。
+
+        nxt = (*before)-&gt;h_next;
+        (*before)-&gt;h_next = 0;   
+        *before = nxt;
+        return;
+    }
+
+    assert(*before != 0);
+}
+
+
+//查找item。返回前驱结点的h_next成员地址，
+//如果查找失败那么就返回冲突链中最后
+//一个节点的h_next成员地址。因为最后一个节点的h_next的值
+//为NULL。通过对返回值使用*运算即可知道有没有查找成功
+static item** _hashitem_before (const char *key, 
+               const size_t nkey, const uint32_t hv) {
+    item **pos;
+    unsigned int oldbucket;
+
+    //正在扩展哈希表
+    if (expanding &amp;&amp; (oldbucket = 
+        (hv &amp; hashmask(hashpower - 1))) &gt;= 
+        expand_bucket) {
+        pos = &amp;old_hashtable[oldbucket];
+    } else {
+        //找到哈希表中对应的桶的位置
+        pos = &amp;primary_hashtable[hv &amp; 
+                                hashmask(hashpower)];
+    }
+
+    //遍历桶的冲突链查找item
+    while (*pos &amp;&amp; ((nkey != (*pos)-&gt;nkey) || 
+           memcmp(key, ITEM_key(*pos), nkey))) {
+        pos = &amp;(*pos)-&gt;h_next;
+    }
+    //*pos就可以知道有没有查找成功。
+    //如果*pos等于NULL那么查找失败，否则查找成功
+    return pos;
+}
+</code></pre><h3 id="Hash表的扩展"><a href="#Hash表的扩展" class="headerlink" title="Hash表的扩展"></a>Hash表的扩展</h3><p>当哈希表中item的数量达到了哈希表表长的1.5倍时，那么就会扩展哈希表增大哈希表的表长，这样就涉及到数据的迁移，由于数据迁移是一个浩大的工作，需要一个专门的线程maintenance_thread来进行。</p>
+<pre><code>//main函数会调用本函数，启动数据迁移线程
+int start_assoc_maintenance_thread() {
+    int ret;
+    char *env = getenv(&quot;MEMCACHED_HASH_BULK_MOVE&quot;);
+    if (env != NULL) {
+        //hash_bulk_move的作用在后面会说到。
+        //这里是通过环境变量给hash_bulk_move赋值
+        hash_bulk_move = atoi(env);
+        if (hash_bulk_move == 0) {
+            hash_bulk_move = DEFAULT_HASH_BULK_MOVE;
+        }
+    }
+    if ((ret = pthread_create(&amp;maintenance_tid, NULL,
+              assoc_maintenance_thread, NULL)) != 0) {
+        fprintf(stderr, &quot;Can&apos;t create thread: %s\n&quot;,
+                         strerror(ret));
+        return -1;
+    }
+    return 0;
+}
+</code></pre><p>迁移线程被创建后会进入休眠状态(通过等待条件变量)，当worker线程插入item后，发现需要扩展哈希表就会调用assoc_start_expand函数唤醒这个迁移线程。</p>
+<pre><code>static bool started_expanding = false;
+
+//assoc_insert函数会调用本函数，当item数量到了哈希表表长的1.5倍才会调用的
+static void assoc_start_expand(void) {
+    if (started_expanding)
+        return;
+    started_expanding = true;
+    pthread_cond_signal(&amp;maintenance_cond);
+}
+
+
+static bool expanding = false;
+static volatile int do_run_maintenance_thread = 1;
+static void *assoc_maintenance_thread(void *arg) {
+
+    //do_run_maintenance_thread是全局变量，初始值为1，在stop_assoc_maintenance_thread
+    //函数中会被赋值0，终止迁移线程
+    while (do_run_maintenance_thread) {
+        int ii = 0;
+
+        //上锁
+        item_lock_global();
+        mutex_lock(&amp;cache_lock);
+
+        ...//进行item迁移
+
+        //遍历完就释放锁
+        mutex_unlock(&amp;cache_lock);
+        item_unlock_global();
+
+
+        if (!expanding) {//不需要迁移数据(了)。
+            mutex_lock(&amp;cache_lock);
+            started_expanding = false; //重置
+
+            //挂起迁移线程，直到worker线程插入数据后发现item数量已经到了1.5倍哈希表大小，
+            //此时调用worker线程调用assoc_start_expand函数，该函数会调用pthread_cond_signal
+            //唤醒迁移线程
+            pthread_cond_wait(&amp;maintenance_cond, 
+                              &amp;cache_lock);
+            mutex_unlock(&amp;cache_lock);
+
+            ...
+
+            mutex_lock(&amp;cache_lock);
+            //申请更大的哈希表,并将expanding设置为true
+            assoc_expand();
+            mutex_unlock(&amp;cache_lock);
+        }
+    }
+    return NULL;
+}
+</code></pre><p>为了不影响worker thread，memcached采用逐步迁移，每次都只迁移hash_bulk_move个桶，逐步迁移的具体做法是，调用assoc_expand函数申请一个新的更大的哈希表，每次迁移都需要给整个hash表上锁。</p>
+<pre><code>static void assoc_expand(void) {
+    old_hashtable = primary_hashtable;
+
+    //申请一个新哈希表，并用old_hashtable指向旧哈希表
+    primary_hashtable = calloc(hashsize(hashpower + 
+                                1), sizeof(void *));
+    if (primary_hashtable) {
+        hashpower++;
+        expanding = true;//标明已经进入扩展状态
+        expand_bucket = 0;//从0号桶开始数据迁移
+    } else {
+        primary_hashtable = old_hashtable;
+    }
+}
+</code></pre>
+          
+        
+      
+    </div>
+
+    <div>
+      
+    </div>
+
+    <div>
+      
+    </div>
+
+    <footer class="post-footer">
+      
+
+      
+
+      
+      
+        <div class="post-eof"></div>
+      
+    </footer>
+  </article>
+
+
+    
+      
+
+  
+  
+
+  
+  
+  
+
+  <article class="post post-type-normal " itemscope itemtype="http://schema.org/Article">
+
+    
+      <header class="post-header">
+
+        
+        
+          <h1 class="post-title" itemprop="name headline">
+            
+            
+              
+                
                 <a class="post-title-link" href="/2016/06/28/memcached源码剖析之网络/" itemprop="url">
                   memcached源码剖析之网络
                 </a>
@@ -1402,7 +1750,7 @@ static void thread_libevent_process(int fd, short which, void *arg) {
         <nav class="site-state motion-element">
           <div class="site-state-item site-state-posts">
             <a href="/archives">
-              <span class="site-state-item-count">2</span>
+              <span class="site-state-item-count">3</span>
               <span class="site-state-item-name">Artikel</span>
             </a>
           </div>
