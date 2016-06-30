@@ -100,7 +100,7 @@
 <meta property="og:image" content="https://github.com/chenshuiyin/ImageCache/raw/master/slab1.png">
 <meta property="og:image" content="https://github.com/chenshuiyin/ImageCache/raw/master/slab2.png">
 <meta property="og:image" content="https://github.com/chenshuiyin/ImageCache/raw/master/slab3.png">
-<meta property="og:updated_time" content="2016-06-30T02:05:36.000Z">
+<meta property="og:updated_time" content="2016-06-30T02:09:32.000Z">
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="memcached源码剖析之内存管理">
 <meta name="twitter:description" content="参考博客：http://blog.csdn.net/luotuo44/article/details/42737181http://brionas.github.io/2014/01/06/memcached-manage/
@@ -449,7 +449,7 @@ static void item_unlink_q(item *it) {
     sizes[it-&gt;slabs_clsid]--;//个数减一
     return;
 }
-</code></pre><h3 id="LRU更新"><a href="#LRU更新" class="headerlink" title="LRU更新"></a>LRU更新</h3><pre><code>#define ITEM_UPDATE_INTERVAL 60 //更新频率为60秒
+</code></pre><h4 id="LRU更新"><a href="#LRU更新" class="headerlink" title="LRU更新"></a>LRU更新</h4><pre><code>#define ITEM_UPDATE_INTERVAL 60 //更新频率为60秒
 
 void do_item_update(item *it) {
     //下面的代码可以看到update操作是耗时的。如果这个item频繁被访问，那么会导致过多的update，过多的一系列费时操作。此时更新间隔就应运而生了。如果上一次的访问时间(也可以说是update时间)距离现在(current_time)还在更新间隔内的，就不更新。超出了才更新。
@@ -883,7 +883,7 @@ static void *do_slabs_alloc(const size_t size, unsigned int id) {
               
             
             
-              <div class="post-toc-content"><ol class="nav"><li class="nav-item nav-level-2"><a class="nav-link" href="#内存管理系统简介"><span class="nav-number">1.</span> <span class="nav-text">内存管理系统简介</span></a><ol class="nav-child"><li class="nav-item nav-level-3"><a class="nav-link" href="#slabclass-t结构体"><span class="nav-number">1.1.</span> <span class="nav-text">slabclass_t结构体</span></a></li><li class="nav-item nav-level-3"><a class="nav-link" href="#item结构体"><span class="nav-number">1.2.</span> <span class="nav-text">item结构体</span></a></li><li class="nav-item nav-level-3"><a class="nav-link" href="#LRU链"><span class="nav-number">1.3.</span> <span class="nav-text">LRU链</span></a><ol class="nav-child"><li class="nav-item nav-level-4"><a class="nav-link" href="#LRU插入"><span class="nav-number">1.3.1.</span> <span class="nav-text">LRU插入</span></a></li><li class="nav-item nav-level-4"><a class="nav-link" href="#LRU删除"><span class="nav-number">1.3.2.</span> <span class="nav-text">LRU删除</span></a></li></ol></li><li class="nav-item nav-level-3"><a class="nav-link" href="#LRU更新"><span class="nav-number">1.4.</span> <span class="nav-text">LRU更新</span></a></li><li class="nav-item nav-level-3"><a class="nav-link" href="#slab初始化"><span class="nav-number">1.5.</span> <span class="nav-text">slab初始化</span></a></li><li class="nav-item nav-level-3"><a class="nav-link" href="#申请内存"><span class="nav-number">1.6.</span> <span class="nav-text">申请内存</span></a></li></ol></li></ol></div>
+              <div class="post-toc-content"><ol class="nav"><li class="nav-item nav-level-2"><a class="nav-link" href="#内存管理系统简介"><span class="nav-number">1.</span> <span class="nav-text">内存管理系统简介</span></a><ol class="nav-child"><li class="nav-item nav-level-3"><a class="nav-link" href="#slabclass-t结构体"><span class="nav-number">1.1.</span> <span class="nav-text">slabclass_t结构体</span></a></li><li class="nav-item nav-level-3"><a class="nav-link" href="#item结构体"><span class="nav-number">1.2.</span> <span class="nav-text">item结构体</span></a></li><li class="nav-item nav-level-3"><a class="nav-link" href="#LRU链"><span class="nav-number">1.3.</span> <span class="nav-text">LRU链</span></a><ol class="nav-child"><li class="nav-item nav-level-4"><a class="nav-link" href="#LRU插入"><span class="nav-number">1.3.1.</span> <span class="nav-text">LRU插入</span></a></li><li class="nav-item nav-level-4"><a class="nav-link" href="#LRU删除"><span class="nav-number">1.3.2.</span> <span class="nav-text">LRU删除</span></a></li><li class="nav-item nav-level-4"><a class="nav-link" href="#LRU更新"><span class="nav-number">1.3.3.</span> <span class="nav-text">LRU更新</span></a></li></ol></li><li class="nav-item nav-level-3"><a class="nav-link" href="#slab初始化"><span class="nav-number">1.4.</span> <span class="nav-text">slab初始化</span></a></li><li class="nav-item nav-level-3"><a class="nav-link" href="#申请内存"><span class="nav-number">1.5.</span> <span class="nav-text">申请内存</span></a></li></ol></li></ol></div>
             
           </div>
         </section>
