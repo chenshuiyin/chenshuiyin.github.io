@@ -175,7 +175,7 @@
             
               <i class="menu-item-icon fa fa-fw fa-home"></i> <br />
             
-            Home
+            Startseite
           </a>
         </li>
       
@@ -185,7 +185,7 @@
             
               <i class="menu-item-icon fa fa-fw fa-archive"></i> <br />
             
-            Archives
+            Archiv
           </a>
         </li>
       
@@ -251,7 +251,7 @@
             <span class="post-meta-item-icon">
               <i class="fa fa-calendar-o"></i>
             </span>
-            <span class="post-meta-item-text">Posted on</span>
+            <span class="post-meta-item-text">Veröffentlicht am</span>
             <time itemprop="dateCreated" datetime="2016-06-28T00:04:54+08:00" content="2016-06-28">
               2016-06-28
             </time>
@@ -392,7 +392,72 @@ static item *heads[LARGEST_ID]; //LRU链首指针,  每个classid一个LRU链
 //指向每一个LRU队列尾
 static item *tails[LARGEST_ID]; //LRU链尾指针，每个classid一个LRU链
 </code></pre><p>LRU链是memcached用来淘汰内存中过期的item的，每个slabclass都保存着一个LRU队列，而head[i]和tail[i]则就是id为i的slabclass LRU队列的头部和尾部，也是采用的头插法，即越靠近head的item越是最近访问到的，所以每次访问到一个item会将它在LRU链中移动到靠前的位置，但是为来避免某一个item由于被频繁的访问引起频繁的在LRU中移动，memcached设置了一个时间间隔来控制它。</p>
-<h3 id="slab初始化"><a href="#slab初始化" class="headerlink" title="slab初始化"></a>slab初始化</h3><p>slab初始化的整个流程可以看下面这张图。<br><img src="https://github.com/chenshuiyin/ImageCache/raw/master/slab2.png" alt="memcached网络"></p>
+<h4 id="LRU插入"><a href="#LRU插入" class="headerlink" title="LRU插入"></a>LRU插入</h4><pre><code>//将item插入到LRU队列的头部
+static void item_link_q(item *it) {
+    item **head, **tail;
+    assert(it-&gt;slabs_clsid &lt; LARGEST_ID);
+    assert((it-&gt;it_flags &amp; ITEM_SLABBED) == 0);
+
+    head = &amp;heads[it-&gt;slabs_clsid];
+    tail = &amp;tails[it-&gt;slabs_clsid];
+    assert(it != *head);
+    assert((*head &amp;&amp; *tail) || 
+           (*head == 0 &amp;&amp; *tail == 0));
+
+    //头插法插入该item
+    it-&gt;prev = 0;
+    it-&gt;next = *head;
+    if (it-&gt;next) it-&gt;next-&gt;prev = it;
+    *head = it;//该item作为对应链表的第一个节点
+
+    //如果该item是对应id上的第一个item，那么还会被认为是该id链上的最后一个item
+    //因为在head那里使用头插法，所以第一个插入的item，到了后面确实成了最后一个item
+    if (*tail == 0) *tail = it;
+    sizes[it-&gt;slabs_clsid]++;//个数加一
+    return;
+}
+</code></pre><h4 id="LRU删除"><a href="#LRU删除" class="headerlink" title="LRU删除"></a>LRU删除</h4><pre><code>//将it从对应的LRU队列中删除
+static void item_unlink_q(item *it) {
+    item **head, **tail;
+    assert(it-&gt;slabs_clsid &lt; LARGEST_ID);
+    head = &amp;heads[it-&gt;slabs_clsid];
+    tail = &amp;tails[it-&gt;slabs_clsid];
+
+
+    if (*head == it) {//链表上的第一个节点
+        assert(it-&gt;prev == 0);
+        *head = it-&gt;next;
+    }
+    if (*tail == it) {//链表上的最后一个节点
+        assert(it-&gt;next == 0);
+        *tail = it-&gt;prev;
+    }
+    assert(it-&gt;next != it);
+    assert(it-&gt;prev != it);
+
+    //把item的前驱节点和后驱节点连接起来
+    if (it-&gt;next) it-&gt;next-&gt;prev = it-&gt;prev;
+    if (it-&gt;prev) it-&gt;prev-&gt;next = it-&gt;next;
+    sizes[it-&gt;slabs_clsid]--;//个数减一
+    return;
+}
+</code></pre><h3 id="LRU更新"><a href="#LRU更新" class="headerlink" title="LRU更新"></a>LRU更新</h3><pre><code>#define ITEM_UPDATE_INTERVAL 60 //更新频率为60秒
+
+void do_item_update(item *it) {
+    //下面的代码可以看到update操作是耗时的。如果这个item频繁被访问，那么会导致过多的update，过多的一系列费时操作。此时更新间隔就应运而生了。如果上一次的访问时间(也可以说是update时间)距离现在(current_time)还在更新间隔内的，就不更新。超出了才更新。
+    if (it-&gt;time &lt; current_time -     
+                    ITEM_UPDATE_INTERVAL) {
+
+        mutex_lock(&amp;cache_lock);
+        if ((it-&gt;it_flags &amp; ITEM_LINKED) != 0) {
+            item_unlink_q(it);//从LRU队列中删除
+            it-&gt;time = current_time;//更新访问时间
+            item_link_q(it);//插入到LRU队列的头部
+        }
+        mutex_unlock(&amp;cache_lock);
+    }
+}
+</code></pre><h3 id="slab初始化"><a href="#slab初始化" class="headerlink" title="slab初始化"></a>slab初始化</h3><p>slab初始化的整个流程可以看下面这张图。<br><img src="https://github.com/chenshuiyin/ImageCache/raw/master/slab2.png" alt="memcached网络"></p>
 <pre><code>//slabs.c文件
 static size_t mem_limit = 0;//用户设置的内存最大限制
 static size_t mem_malloced = 0;
@@ -735,7 +800,7 @@ static void *do_slabs_alloc(const size_t size, unsigned int id) {
             <span class="post-meta-item-icon">
               <i class="fa fa-calendar-o"></i>
             </span>
-            <span class="post-meta-item-text">Posted on</span>
+            <span class="post-meta-item-text">Veröffentlicht am</span>
             <time itemprop="dateCreated" datetime="2016-06-28T00:03:20+08:00" content="2016-06-28">
               2016-06-28
             </time>
@@ -1083,7 +1148,7 @@ static void *assoc_maintenance_thread(void *arg) {
             <span class="post-meta-item-icon">
               <i class="fa fa-calendar-o"></i>
             </span>
-            <span class="post-meta-item-text">Posted on</span>
+            <span class="post-meta-item-text">Veröffentlicht am</span>
             <time itemprop="dateCreated" datetime="2016-06-28T00:03:20+08:00" content="2016-06-28">
               2016-06-28
             </time>
@@ -1751,7 +1816,7 @@ static void thread_libevent_process(int fd, short which, void *arg) {
           <div class="site-state-item site-state-posts">
             <a href="/archives">
               <span class="site-state-item-count">3</span>
-              <span class="site-state-item-name">posts</span>
+              <span class="site-state-item-name">Artikel</span>
             </a>
           </div>
 
@@ -1761,7 +1826,7 @@ static void thread_libevent_process(int fd, short which, void *arg) {
             <div class="site-state-item site-state-tags">
               <a href="/tags">
                 <span class="site-state-item-count">1</span>
-                <span class="site-state-item-name">tags</span>
+                <span class="site-state-item-name">Tags</span>
               </a>
             </div>
           
@@ -1805,7 +1870,7 @@ static void thread_libevent_process(int fd, short which, void *arg) {
 </div>
 
 <div class="powered-by">
-  Powered by <a class="theme-link" href="http://hexo.io">Hexo</a>
+  Erstellt mit  <a class="theme-link" href="http://hexo.io">Hexo</a>
 </div>
 
 <div class="theme-info">
